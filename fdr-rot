@@ -1,0 +1,213 @@
+#!/usr/bin/env ruby
+require 'pg'
+
+BLOAT_QUERY = <<-eos
+WITH constants AS (
+  SELECT current_setting('block_size')::numeric AS bs, 23 AS hdr, 4 AS ma
+), bloat_info AS (
+  SELECT
+    ma,bs,schemaname,tablename,
+    (datawidth+(hdr+ma-(case when hdr%ma=0 THEN ma ELSE hdr%ma END)))::numeric AS datahdr,
+    (maxfracsum*(nullhdr+ma-(case when nullhdr%ma=0 THEN ma ELSE nullhdr%ma END))) AS nullhdr2
+  FROM (
+    SELECT
+      schemaname, tablename, hdr, ma, bs,
+      SUM((1-null_frac)*avg_width) AS datawidth,
+      MAX(null_frac) AS maxfracsum,
+      hdr+(
+        SELECT 1+count(*)/8
+        FROM pg_stats s2
+        WHERE null_frac<>0 AND s2.schemaname = s.schemaname AND s2.tablename = s.tablename
+      ) AS nullhdr
+    FROM pg_stats s, constants
+    GROUP BY 1,2,3,4,5
+  ) AS foo
+), index_bloat AS (
+  SELECT
+    i.indexrelid,
+    -- NB: indrelid (the connected table) and indexrelid (the index
+    -- itself) are totally different entities, in spite of similar
+    -- naming.
+    i.indrelid AS tablerelid,
+    schemaname, tablename, bs,
+    COALESCE(c2.relname,'?') AS iname, COALESCE(c2.reltuples,0) AS ituples, COALESCE(c2.relpages,0) AS ipages,
+    COALESCE(CEIL((c2.reltuples*(datahdr-12))/(bs-20::float)),0) AS iotta
+  FROM bloat_info
+  JOIN pg_class cc ON cc.relname = bloat_info.tablename
+  JOIN pg_namespace nn ON cc.relnamespace = nn.oid AND nn.nspname = bloat_info.schemaname AND nn.nspname <> 'information_schema'
+  JOIN pg_index i ON indrelid = cc.oid
+  JOIN pg_class c2 ON c2.oid = i.indexrelid
+                      -- Avoid system indexes, for non-superuser execution.
+                      AND c2.relowner <> 10
+                      -- Avoid primary keys, which require table
+                      -- constraint manipulation (rather than a single
+                      -- CREATE INDEX)
+                      AND NOT i.indisprimary
+)
+SELECT *
+FROM (
+  SELECT
+    indexrelid,
+    indexrelid::regclass AS indexregclass,
+    tablerelid::regclass AS tableregclass,
+    schemaname || '.' || tablename || '::' || iname as object,
+    ROUND(CASE WHEN iotta=0 OR ipages=0 THEN 0.0 ELSE ipages/iotta::numeric END,1) AS bloat,
+    CASE WHEN ipages < iotta THEN '0' ELSE (bs*(ipages-iotta))::bigint END AS raw_waste,
+    pg_get_indexdef(indexrelid)
+  FROM
+    index_bloat) as dummy
+  WHERE raw_waste > 64*1024*1024 AND bloat > 2
+ORDER BY raw_waste DESC, bloat DESC
+;
+eos
+
+IndexDefParts = Struct.new(:prelude, :index_name, :epilogue)
+
+def extract_index_name(pg_get_indexdef)
+  m = /\A(?<prelude>CREATE.+?INDEX) (?<index_name>.+?) (?<epilogue>ON .+?)\z/
+    .match(pg_get_indexdef)
+
+  IndexDefParts.new(m['prelude'], m['index_name'], m['epilogue'])
+end
+
+def bloats(cn)
+  res = cn.query(BLOAT_QUERY)
+  res.to_a
+end
+
+def is_used_by_constraint(cn, index_name)
+  # Check is a index is used by a constraint object.
+  constraint_query = <<-eos
+SELECT count(*) > 0 AS used
+FROM pg_depend JOIN pg_constraint
+  ON pg_depend.objid = $1::regclass
+  AND pg_constraint.oid = pg_depend.refobjid;
+eos
+
+  res = cn.query(constraint_query, [index_name])
+  res[0].fetch('used') == 't'
+end
+
+def check_index_valid(cn, index_name)
+  res = cn.query(
+    'SELECT indisvalid FROM pg_index WHERE indexrelid = $1::regclass',
+    [index_name])
+  if res[0].fetch('indisvalid') != 't'
+    # Most likely result of a race condition from two running copies.
+    raise 'BUG: Was about to promote an invalid index'
+  end
+
+  pb 'Index confirmed as valid (\'indisvalid\' attribute)...'
+end
+
+def maybe_exec(cn, query)
+  # Execute, but only if a production-paranoia flag is set in the
+  # environment.  Otherwise, print the rotation workload only.
+  puts(query[-1].end_with?(';') ? query : query + ';')
+
+  if ENV['FDR_ROT_REALLY_DO_IT'] == 'true'
+    cn.exec(query)
+  end
+end
+
+def pb(s)
+  # pb: "Print Banner"
+  puts '-- ' + s.gsub("\n", "\n-- ")
+end
+
+def print_stats(bloat, raw_waste, pg_get_indexdef)
+  pb "Bloat Statistics: bloat=#{bloat}, bytes=#{raw_waste}"
+  pb "Definition: #{pg_get_indexdef}"
+end
+
+def postgres_url_deconstruct(s)
+  # Handle postgres:// urls, because "pg" doesn't see fit to expose
+  # modern libpq functionality of the same.
+  require 'uri'
+  u = URI.parse(s)
+  if u.scheme != 'postgres'
+    raise "Cannot parse URI a postgres one: #{s.inspect}"
+  end
+
+  user, password = if u.userinfo.nil?
+                     [nil, nil]
+                   else
+                     parts = u.userinfo.split(':')
+                     case parts.length
+                     when 1
+                       [parts.first, nil]
+                     when 2
+                       parts
+                     else
+                       raise 'BUG'
+                     end
+                   end
+
+  {
+    host: u.host,
+    dbname: u.path[1..-1],
+    port: u.port,
+    user: user,
+    password: password
+  }.select do |k, v|
+    # Avoid including nil entries so libpq defaults (like environment
+    # variables) can be used.
+    !v.nil?
+  end
+end
+
+uri = ENV['FDR_ROT_DATABASE_URL']
+cn = if uri.nil?
+       PG::Connection.new()
+     else
+       h = postgres_url_deconstruct(uri)
+       PG::Connection.new(h)
+     end
+
+bloats(cn).each do |b|
+  object = b.fetch('object')
+  bloat = b.fetch('bloat')
+  raw_waste = b.fetch('raw_waste')
+  indexregclass = b.fetch('indexregclass')
+  pg_get_indexdef = b.fetch('pg_get_indexdef')
+
+  # Avoid constraint-associated indexes for simplicity sake.
+  #
+  # Indexes created by the following are an example:
+  #
+  #   ALTER TABLE foo ADD CONSTRAINT bar UNIQUE (baz);
+  puts ''
+  if is_used_by_constraint(cn, indexregclass)
+    pb "Skipping #{object}"
+    pb "\tIt is part of a constraint."
+    print_stats(bloat, raw_waste, pg_get_indexdef)
+    next
+  end
+
+  pb "Processing #{object}"
+  print_stats(bloat, raw_waste, pg_get_indexdef)
+
+  parts = extract_index_name(pg_get_indexdef)
+
+  if parts.index_name != b.fetch('indexregclass')
+    # There are liable to be spurious non-bugs caught by this
+    # involving difference in schema qualification.  But, many
+    # databases have one schema, so add this safety until then.
+    raise 'BUG: regexp extraction of index name and regclass should agree.'
+  end
+
+  q_temp_index_name = cn.quote_ident('_fdr_rot_' + parts.index_name)
+  q_index_name = cn.quote_ident(parts.index_name)
+  q_table_name = cn.quote_ident(b.fetch('tableregclass'))
+  maybe_exec(cn, "#{parts.prelude} CONCURRENTLY #{q_temp_index_name} #{parts.epilogue}")
+
+  # Force statistics gathering on the table, which otherwise seem to
+  # lag creation of the new index until autovacuum picks it up.
+  maybe_exec(cn, "ANALYZE #{q_table_name}")
+
+  maybe_exec(cn, 'BEGIN')
+  check_index_valid(cn, parts.index_name)
+  maybe_exec(cn, "DROP INDEX #{q_index_name}")
+  maybe_exec(cn, "ALTER INDEX #{q_temp_index_name} RENAME TO #{q_index_name}")
+  maybe_exec(cn, "COMMIT")
+end
